@@ -50,7 +50,7 @@ export function classifyTurn(turn: TurnActivity): ClassifiedEvent | undefined {
 		/\b(build|check|lint|tsc|eslint|biome|prettier)\b/i.test(b.command),
 	);
 	const hasBuildFailure = bashCommands.some((b) =>
-		/\b(build|check|lint|tsc|eslint|biome)\b/i.test(b.command) && b.isError,
+		/\b(build|check|lint|tsc|eslint|biome|prettier)\b/i.test(b.command) && b.isError,
 	);
 
 	// Gotcha: test or build failure.

@@ -122,7 +122,7 @@ function classifyTurn(turn: TurnActivity): ClassifiedEvent | undefined {
 		/\b(build|check|lint|tsc|eslint|biome|prettier)\b/i.test(b.command),
 	);
 	const hasBuildFailure = bashCommands.some((b) =>
-		/\b(build|check|lint|tsc|eslint|biome)\b/i.test(b.command) && b.isError,
+		/\b(build|check|lint|tsc|eslint|biome|prettier)\b/i.test(b.command) && b.isError,
 	);
 
 	// Gotcha: test or build failure.
@@ -289,10 +289,16 @@ async function poll(pi: ExtensionAPI): Promise<void> {
 	updateStatus(true);
 }
 
+let polling = false;
+
 function startPolling(pi: ExtensionAPI): void {
 	stopPolling();
-	poll(pi);
-	pollTimer = setInterval(() => poll(pi), POLL_INTERVAL_MS);
+	void poll(pi).catch(() => {});
+	pollTimer = setInterval(async () => {
+		if (polling) return;
+		polling = true;
+		try { await poll(pi); } finally { polling = false; }
+	}, POLL_INTERVAL_MS);
 }
 
 function stopPolling(): void {
