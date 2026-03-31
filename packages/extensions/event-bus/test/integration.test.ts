@@ -10,6 +10,13 @@
  * - Event bus server must be running at AGENT_EVENT_BUS_URL (default http://127.0.0.1:8080/mcp)
  */
 
+// The extension reads PI_EVENT_BUS_POLL_INTERVAL at module scope as a const.
+// We must set it before the module is loaded, then use dynamic import inside
+// beforeAll so the env var takes effect. ESM import hoisting would defeat a
+// static import placed after this assignment.
+const savedPollInterval = process.env.PI_EVENT_BUS_POLL_INTERVAL;
+process.env.PI_EVENT_BUS_POLL_INTERVAL = "1";
+
 import { execSync } from "node:child_process";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -18,19 +25,6 @@ import {
 } from "../../../coding-agent/test/test-harness.js";
 import type { AssistantMessage } from "@mariozechner/pi-ai";
 import type { ExtensionFactory } from "@mariozechner/pi-coding-agent";
-
-// The extension reads PI_EVENT_BUS_POLL_INTERVAL at module scope as a const.
-// We must set it before the module is loaded, then use dynamic import.
-const savedPollInterval = process.env.PI_EVENT_BUS_POLL_INTERVAL;
-process.env.PI_EVENT_BUS_POLL_INTERVAL = "1";
-
-let eventBusExtension: ExtensionFactory;
-beforeAll(async () => {
-	// Dynamic import ensures the env var is set before module evaluation
-	vi.resetModules();
-	const mod = await import("../extensions/event-bus.js");
-	eventBusExtension = mod.default;
-});
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -92,7 +86,6 @@ function registerSession(
 			.join(" "),
 		{ timeout: 5_000, encoding: "utf-8" },
 	);
-	// The CLI outputs human-readable lines then JSON. Extract the JSON block.
 	const jsonMatch = result.match(/\{[\s\S]*\}/);
 	if (!jsonMatch)
 		throw new Error(`Failed to parse register output: ${result}`);
@@ -185,9 +178,17 @@ describe.skipIf(!cliAvailable || !busReachable)(
 	"event bus integration",
 	() => {
 		let harness: Harness;
+		let eventBusExtension: ExtensionFactory;
+
+		beforeAll(async () => {
+			// Dynamic import ensures PI_EVENT_BUS_POLL_INTERVAL=1 is visible
+			// when the extension module evaluates its module-level constants.
+			vi.resetModules();
+			const mod = await import("../extensions/event-bus.js");
+			eventBusExtension = mod.default;
+		});
 
 		afterAll(() => {
-			// Restore original poll interval
 			if (savedPollInterval !== undefined) {
 				process.env.PI_EVENT_BUS_POLL_INTERVAL = savedPollInterval;
 			} else {
@@ -195,8 +196,15 @@ describe.skipIf(!cliAvailable || !busReachable)(
 			}
 		});
 
-		afterEach(() => {
-			harness?.cleanup();
+		afterEach(async () => {
+			if (harness) {
+				// Fire session_shutdown so the extension stops polling and unregisters
+				const runner = harness.session.extensionRunner;
+				if (runner?.hasHandlers("session_shutdown")) {
+					await runner.emit({ type: "session_shutdown" });
+				}
+				harness.cleanup();
+			}
 		});
 
 		it("registers with event bus on session start", async () => {
@@ -207,10 +215,8 @@ describe.skipIf(!cliAvailable || !busReachable)(
 				extensionFactories: [eventBusExtension],
 			});
 
-			// bindExtensions fires session_start which triggers registration
 			await harness.session.bindExtensions({});
 
-			// Wait for async registration to complete
 			await waitFor(() => getSessionCount() > countBefore, {
 				timeoutMs: 5_000,
 				label: "session registration",
@@ -223,14 +229,12 @@ describe.skipIf(!cliAvailable || !busReachable)(
 			"injects external event and triggers faux LLM response",
 			async () => {
 				harness = await createHarnessWithExtensions({
-					// Responses cycle: first for user prompt, second for injected event
 					responses: ["user reply", "event reply"],
 					extensionFactories: [eventBusExtension],
 				});
 
 				await harness.session.bindExtensions({});
 
-				// Wait for registration
 				await waitFor(() => getSessionCount() > 0, {
 					timeoutMs: 5_000,
 					label: "session registration",
@@ -240,20 +244,14 @@ describe.skipIf(!cliAvailable || !busReachable)(
 				await harness.session.prompt("hello");
 				expect(harness.faux.callCount).toBe(1);
 
-				// Wait for at least one poll cycle to complete so the resume cursor
-				// is stable. Without this, the test event can be published in the
-				// same instant as the first poll, causing the cursor to advance past it.
-				await new Promise((r) => setTimeout(r, 2000));
-
 				// Register a separate "sender" session to publish events from
 				const uniqueClientId = `integration-test-sender-${Date.now()}`;
 				const sender = registerSession("test-sender", uniqueClientId);
 
 				try {
 					// Publish a high-priority event to the repo channel.
-					// The extension subscribes to repo:<cwd-basename> on register.
-					// help_needed is classified as "normal" priority on non-DM channels,
-					// which triggers injection via followUp delivery.
+					// help_needed is classified as "immediate" priority,
+					// which triggers injection via steer delivery.
 					const repoChan = `repo:${harness.tempDir.split("/").pop() ?? "unknown"}`;
 
 					publishEvent({
@@ -369,14 +367,14 @@ describe.skipIf(!cliAvailable || !busReachable)(
 
 				const countAfterReg = getSessionCount();
 
-				// Emit session_shutdown to trigger unregister (dispose() alone doesn't fire it)
+				// Emit session_shutdown to trigger unregister (dispose() alone doesn't fire it).
+				// afterEach also does this, but the test needs to verify the count dropped.
 				const runner = harness.session.extensionRunner;
 				if (runner?.hasHandlers("session_shutdown")) {
 					await runner.emit({ type: "session_shutdown" });
 				}
 				harness.cleanup();
 
-				// Wait for the unregister to take effect
 				await waitFor(() => getSessionCount() < countAfterReg, {
 					timeoutMs: 5_000,
 					label: "session unregistration",

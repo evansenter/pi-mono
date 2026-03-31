@@ -144,7 +144,7 @@ async function poll(pi: ExtensionAPI): Promise<void> {
 	const result = await execCli(pi, [
 		"events",
 		"--session-id", state.sessionId,
-		"--resume",
+		"--cursor", state.cursor,
 		"--order", "asc",
 		"--json",
 		"--exclude", "session_registered,session_unregistered",
