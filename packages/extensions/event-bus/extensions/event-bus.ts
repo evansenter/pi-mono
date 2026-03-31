@@ -361,6 +361,11 @@ export default function (pi: ExtensionAPI) {
 		pendingBatchEvents = [];
 		injectedTurnActive = false;
 		consecutiveFailures = 0;
+		agentActive = false;
+		lastInjectionTime = 0;
+		recentInjectionTimes.length = 0;
+		currentTurn = freshTurn();
+		pendingArgs.clear();
 		currentCtx = ctx;
 		if (!cliAvailable) return;
 		const ok = await register(pi, ctx);
