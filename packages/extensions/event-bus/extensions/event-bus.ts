@@ -8,42 +8,26 @@
  */
 
 import type { ExtensionAPI, ExtensionContext, ExecResult } from "@mariozechner/pi-coding-agent";
+import {
+	classifyTurn, freshTurn,
+	extractOutputSnippet, parseJsonFromOutput,
+	classifyEventPriority, formatEventForAgent, isEventStale, buildBatchMessage,
+	type TurnActivity, type BusEvent,
+} from "../lib/classify.js";
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
 const EVENT_BUS_URL = process.env.AGENT_EVENT_BUS_URL ?? "http://127.0.0.1:8080/mcp";
-const POLL_INTERVAL_MS = Number(process.env.PI_EVENT_BUS_POLL_INTERVAL ?? "30") * 1000;
+const ACTIVE_POLL_MS = 5_000;
+const IDLE_POLL_MS = Number(process.env.PI_EVENT_BUS_POLL_INTERVAL ?? "30") * 1_000;
+const INJECTION_COOLDOWN_MS = 30_000;
+const EVENT_TTL_MS = 5 * 60 * 1_000;
+const BACKOFF_BASE_MS = 5_000;
+const BACKOFF_MAX_MS = 5 * 60 * 1_000;
+const MAX_BATCH_SIZE = 20;
 const CLI = "agent-event-bus-cli";
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-interface FileActivity {
-	path: string;
-	action: "write" | "edit";
-}
-
-interface BashActivity {
-	command: string;
-	exitCode: number;
-	outputSnippet: string;
-	isError: boolean;
-}
-
-interface TurnActivity {
-	files: FileActivity[];
-	bashCommands: BashActivity[];
-	toolErrors: string[];
-	toolCallCount: number;
-}
-
-interface ClassifiedEvent {
-	eventType: string;
-	payload: string;
-}
 
 // ---------------------------------------------------------------------------
 // State
@@ -63,99 +47,10 @@ let cliAvailable = false;
 let currentTurn: TurnActivity = freshTurn();
 const pendingArgs = new Map<string, Record<string, unknown>>();
 
-// ---------------------------------------------------------------------------
-// Pure Helpers
-// ---------------------------------------------------------------------------
-
-function freshTurn(): TurnActivity {
-	return { files: [], bashCommands: [], toolErrors: [], toolCallCount: 0 };
-}
-
-function formatFiles(files: FileActivity[]): string {
-	const unique = [...new Set(files.map((f) => f.path))];
-	if (unique.length <= 3) return unique.join(", ");
-	return `${unique.slice(0, 3).join(", ")} +${unique.length - 3} more`;
-}
-
-function truncate(s: string, max: number): string {
-	const oneLine = s.replace(/\n/g, " ").trim();
-	return oneLine.length <= max ? oneLine : `${oneLine.slice(0, max - 1)}\u2026`;
-}
-
-function extractOutputSnippet(content: Array<{ type: string; text?: string }>): string {
-	const text = content
-		.filter((c) => c.type === "text" && c.text)
-		.map((c) => c.text!)
-		.join("\n");
-	const lines = text.split("\n").filter((l) => l.trim().length > 0);
-	return lines.slice(-5).join("\n");
-}
-
-function parseJsonFromOutput(stdout: string): Record<string, unknown> | undefined {
-	const text = stdout.trim();
-	if (!text) return undefined;
-	const jsonStart = text.search(/[{[]/);
-	if (jsonStart === -1) return undefined;
-	try {
-		return JSON.parse(text.slice(jsonStart));
-	} catch {
-		return undefined;
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Classification
-// ---------------------------------------------------------------------------
-
-function classifyTurn(turn: TurnActivity): ClassifiedEvent | undefined {
-	const { files, bashCommands, toolErrors, toolCallCount } = turn;
-
-	const hasMutations = files.length > 0;
-	const hasErrors = toolErrors.length > 0;
-	const hasTestRun = bashCommands.some((b) =>
-		/\b(test|spec|jest|vitest|pytest|cargo test|go test|npm run test|npx .*(vitest|jest))\b/i.test(b.command),
-	);
-	const hasTestFailure = bashCommands.some((b) =>
-		/\b(test|spec|jest|vitest|pytest|cargo test|go test)\b/i.test(b.command) && b.isError,
-	);
-	const hasBuildOrLint = bashCommands.some((b) =>
-		/\b(build|check|lint|tsc|eslint|biome|prettier)\b/i.test(b.command),
-	);
-	const hasBuildFailure = bashCommands.some((b) =>
-		/\b(build|check|lint|tsc|eslint|biome|prettier)\b/i.test(b.command) && b.isError,
-	);
-
-	// Gotcha: test or build failure.
-	if (hasTestFailure || hasBuildFailure) {
-		const failedCmds = bashCommands.filter((b) => b.isError).map((b) => truncate(b.command, 60));
-		const errorSnippets = bashCommands
-			.filter((b) => b.isError && b.outputSnippet)
-			.map((b) => truncate(b.outputSnippet, 120));
-		const parts = [`failed: ${failedCmds.join(", ")}`, ...errorSnippets];
-		if (files.length > 0) {
-			parts.push(`while editing: ${formatFiles(files)}`);
-		}
-		return { eventType: "gotcha_discovered", payload: parts.join(" | ") };
-	}
-
-	// Tool errors with file mutations.
-	if (hasErrors && hasMutations) {
-		return {
-			eventType: "error_pattern",
-			payload: `${toolErrors.length} tool error(s) while editing ${formatFiles(files)}: ${toolErrors.map((e) => truncate(e, 80)).join("; ")}`,
-		};
-	}
-
-	// Substantial work.
-	if (hasMutations && (files.length >= 2 || hasTestRun || hasBuildOrLint || toolCallCount >= 5)) {
-		const parts = [`edited ${formatFiles(files)}`];
-		if (hasTestRun && !hasTestFailure) parts.push("tests passed");
-		if (hasBuildOrLint && !hasBuildFailure) parts.push("build/lint clean");
-		return { eventType: "task_completed", payload: parts.join(", ") };
-	}
-
-	return undefined;
-}
+let agentActive = false;
+let lastInjectionTime = 0;
+let consecutiveFailures = 0;
+let pendingBatchEvents: BusEvent[] = [];
 
 // ---------------------------------------------------------------------------
 // CLI / Status Helpers
@@ -246,19 +141,29 @@ async function poll(pi: ExtensionAPI): Promise<void> {
 	const result = await execCli(pi, [
 		"events",
 		"--session-id", state.sessionId,
-		"--resume",
+		"--cursor", state.cursor,
 		"--order", "asc",
 		"--json",
 		"--exclude", "session_registered,session_unregistered",
 	]);
 
 	if (result.code !== 0) {
-		updateStatus(false);
+		consecutiveFailures++;
+		const backoffMs = Math.min(
+			BACKOFF_BASE_MS * Math.pow(2, consecutiveFailures - 1),
+			BACKOFF_MAX_MS,
+		);
+		updateStatus(false, `retry in ${Math.round(backoffMs / 1000)}s`);
+		stopPolling();
+		// Safe: if agent state changes during backoff, reschedulePolling clears this timer via stopPolling.
+		backoffTimer = setTimeout(() => { backoffTimer = undefined; if (state) startPolling(pi); }, backoffMs);
 		return;
 	}
 
 	const data = parseJson(result);
 	if (!data) return;
+
+	consecutiveFailures = 0;
 
 	if (typeof data.next_cursor === "string") {
 		state.cursor = data.next_cursor;
@@ -275,21 +180,37 @@ async function poll(pi: ExtensionAPI): Promise<void> {
 		const sender = evt.session_display_id as string ?? evt.session_name as string ?? "unknown";
 		const payload = evt.payload as string ?? "";
 		const channel = evt.channel as string ?? "";
+		const eventSessionId = evt.session_id as string ?? "";
+
+		// Source filtering: skip own events
+		if (eventSessionId === state.sessionId) continue;
+
+		// TTL filtering: skip stale events
+		const rawTimestamp = evt.timestamp as number ?? 0;
+		const timestampMs = rawTimestamp > 1e12 ? rawTimestamp : rawTimestamp * 1000;
+		if (isEventStale(timestampMs, EVENT_TTL_MS)) continue;
 
 		const isDm = channel.startsWith("session:") && channel.includes(state.sessionId);
-		const isRepoTargeted = channel.startsWith("repo:");
-		const notifType = isDm ? "warning" as const : "info" as const;
+		const priority = classifyEventPriority(eventType, isDm);
 
-		const prefix = isDm ? "[DM]" : isRepoTargeted ? `[${channel}]` : "[bus]";
-		const line = `${prefix} ${sender}: ${eventType}${payload ? ` — ${payload}` : ""}`;
-
-		currentCtx.ui.notify(line, notifType);
+		if (priority === "ambient") {
+			const isRepoTargeted = channel.startsWith("repo:");
+			const notifType = isDm ? "warning" as const : "info" as const;
+			const prefix = isDm ? "[DM]" : isRepoTargeted ? `[${channel}]` : "[bus]";
+			const line = `${prefix} ${sender}: ${eventType}${payload ? ` — ${payload}` : ""}`;
+			currentCtx.ui.notify(line, notifType);
+		} else {
+			pendingBatchEvents.push({ eventType, sender, payload, channel, timestampMs });
+		}
 	}
+
+	flushInjections(pi);
 
 	updateStatus(true);
 }
 
 let polling = false;
+let backoffTimer: ReturnType<typeof setTimeout> | undefined;
 
 function startPolling(pi: ExtensionAPI): void {
 	stopPolling();
@@ -298,7 +219,7 @@ function startPolling(pi: ExtensionAPI): void {
 		if (polling) return;
 		polling = true;
 		try { await poll(pi); } finally { polling = false; }
-	}, POLL_INTERVAL_MS);
+	}, agentActive ? ACTIVE_POLL_MS : IDLE_POLL_MS);
 }
 
 function stopPolling(): void {
@@ -306,6 +227,15 @@ function stopPolling(): void {
 		clearInterval(pollTimer);
 		pollTimer = undefined;
 	}
+	if (backoffTimer != null) {
+		clearTimeout(backoffTimer);
+		backoffTimer = undefined;
+	}
+}
+
+function reschedulePolling(pi: ExtensionAPI): void {
+	stopPolling();
+	startPolling(pi);
 }
 
 // ---------------------------------------------------------------------------
@@ -325,6 +255,46 @@ async function autoPublish(pi: ExtensionAPI, turn: TurnActivity): Promise<void> 
 		"--channel", `repo:${currentCtx?.cwd.split("/").pop() ?? "unknown"}`,
 		"--session-id", state.sessionId,
 	]);
+}
+
+function flushInjections(pi: ExtensionAPI): void {
+	if (pendingBatchEvents.length === 0 || !currentCtx) return;
+
+	const now = Date.now();
+
+	// Cooldown: at most one injection per INJECTION_COOLDOWN_MS.
+	// This alone prevents runaway loops (max ~2 injections/min at 30s cooldown).
+	// Source filtering also prevents self-injection, providing a second safety layer.
+	if (now - lastInjectionTime < INJECTION_COOLDOWN_MS) {
+		return;
+	}
+
+	// Cap batch size
+	if (pendingBatchEvents.length > MAX_BATCH_SIZE) {
+		currentCtx.ui.notify(
+			`[Event Bus] Dropping ${pendingBatchEvents.length - MAX_BATCH_SIZE} oldest events (batch cap)`,
+			"warning",
+		);
+		pendingBatchEvents = pendingBatchEvents.slice(-MAX_BATCH_SIZE);
+	}
+
+	// Determine highest priority in batch
+	const hasImmediate = pendingBatchEvents.some((e) => {
+		const isDm = e.channel.startsWith("session:") && state ? e.channel.includes(state.sessionId) : false;
+		return classifyEventPriority(e.eventType, isDm) === "immediate";
+	});
+
+	const content = buildBatchMessage(pendingBatchEvents);
+	const customType = hasImmediate ? "event-bus-urgent" : "event-bus-event";
+	const deliverAs = hasImmediate ? "steer" as const : "followUp" as const;
+
+	pi.sendMessage(
+		{ customType, content, display: true },
+		{ triggerTurn: true, deliverAs },
+	);
+
+	lastInjectionTime = now;
+	pendingBatchEvents = [];
 }
 
 // ---------------------------------------------------------------------------
@@ -364,6 +334,12 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_switch", async (_event, ctx) => {
 		stopPolling();
+		pendingBatchEvents = [];
+		consecutiveFailures = 0;
+		agentActive = false;
+		lastInjectionTime = 0;
+		currentTurn = freshTurn();
+		pendingArgs.clear();
 		currentCtx = ctx;
 		if (!cliAvailable) return;
 		const ok = await register(pi, ctx);
@@ -378,6 +354,8 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_start", async () => {
 		currentTurn = freshTurn();
+		agentActive = true;
+		if (state && cliAvailable) reschedulePolling(pi);
 	});
 
 	pi.on("tool_execution_start", async (event) => {
@@ -419,6 +397,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_end", async () => {
 		await autoPublish(pi, currentTurn);
 		currentTurn = freshTurn();
+		agentActive = false;
+		if (state && cliAvailable) reschedulePolling(pi);
 	});
 
 	// ------------------------------------------------------------------

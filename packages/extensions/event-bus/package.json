@@ -17,6 +17,7 @@
 	},
 	"license": "MIT",
 	"devDependencies": {
+		"@mariozechner/pi-coding-agent": "*",
 		"typescript": "^6.0.2",
 		"vitest": "^4.1.2"
 	}

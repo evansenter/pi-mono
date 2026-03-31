@@ -124,3 +124,53 @@ export function parseJsonFromOutput(stdout: string): Record<string, unknown> | u
 export function freshTurn(): TurnActivity {
 	return { files: [], bashCommands: [], toolErrors: [], toolCallCount: 0 };
 }
+
+// ---------------------------------------------------------------------------
+// Event Priority Classification
+// ---------------------------------------------------------------------------
+
+export type EventPriority = "immediate" | "normal" | "ambient";
+
+export interface BusEvent {
+	eventType: string;
+	sender: string;
+	payload: string;
+	channel: string;
+	timestampMs?: number;
+}
+
+// gotcha_discovered is IMMEDIATE (not NORMAL as in the RFC) because gotchas
+// typically indicate something another session should act on immediately.
+const IMMEDIATE_TYPES = new Set(["help_needed", "blocker", "gotcha_discovered", "ci_failure", "dm"]);
+const NORMAL_TYPES = new Set([
+	"task_completed", "improvement_suggested", "pattern_found",
+	"help_response", "user_broadcast", "rfc_created",
+]);
+
+export function classifyEventPriority(eventType: string, isDm: boolean): EventPriority {
+	if (isDm) return "immediate";
+	if (IMMEDIATE_TYPES.has(eventType)) return "immediate";
+	if (NORMAL_TYPES.has(eventType)) return "normal";
+	return "ambient";
+}
+
+export function formatEventForAgent(event: BusEvent): string {
+	const isDm = event.channel.startsWith("session:");
+	const prefix = isDm ? "[DM]" : `[${event.channel}]`;
+	const header = `[Event Bus] ${prefix} ${event.sender}: ${event.eventType}`;
+	const lines = [header];
+	if (event.payload) lines.push(event.payload);
+	return lines.join("\n");
+}
+
+export function isEventStale(timestampMs: number, ttlMs: number): boolean {
+	if (timestampMs === 0) return false;
+	return Date.now() - timestampMs > ttlMs;
+}
+
+export function buildBatchMessage(events: BusEvent[]): string {
+	if (events.length === 1) return formatEventForAgent(events[0]);
+	const header = `[Event Bus] ${events.length} pending events:`;
+	const lines = events.map((e) => formatEventForAgent(e));
+	return [header, ...lines].join("\n\n");
+}
