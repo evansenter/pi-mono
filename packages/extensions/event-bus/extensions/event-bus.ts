@@ -159,6 +159,7 @@ async function poll(pi: ExtensionAPI): Promise<void> {
 		);
 		updateStatus(false, `retry in ${Math.round(backoffMs / 1000)}s`);
 		stopPolling();
+		// Safe: if agent state changes during backoff, reschedulePolling clears this timer via stopPolling.
 		backoffTimer = setTimeout(() => { backoffTimer = undefined; if (state) startPolling(pi); }, backoffMs);
 		return;
 	}
@@ -246,6 +247,8 @@ function reschedulePolling(pi: ExtensionAPI): void {
 // ---------------------------------------------------------------------------
 
 async function autoPublish(pi: ExtensionAPI, turn: TurnActivity): Promise<void> {
+	// Skip auto-publish for turns triggered by event bus injection.
+	// Relies on INJECTION_COOLDOWN_MS >= ACTIVE_POLL_MS to prevent double-set.
 	if (injectedTurnActive) {
 		injectedTurnActive = false;
 		return;

@@ -78,7 +78,7 @@ To prevent runaway injection loops:
 
 | Mechanism | Value | Description |
 |-----------|-------|-------------|
-| Rate limit | 3 injections / min | Excess events are downgraded to AMBIENT |
+| Rate limit | 3 injections / min | Excess events remain buffered until rate window resets |
 | Cooldown | 30 s after each injection | No further injections until cooldown expires |
 | TTL | 5 min | Events older than 5 minutes are skipped |
 | Source filter | Drops own events | Events published by this session are never re-injected |

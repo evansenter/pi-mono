@@ -16,7 +16,7 @@ echo ""
 
 # Test 1: DM → should trigger IMMEDIATE injection
 echo "[Test 1] Sending DM (help_needed) to session..."
-agent-event-bus-cli "${URL_ARGS[@]}" publish \
+agent-event-bus-cli ${URL_ARGS[@]+"${URL_ARGS[@]}"} publish \
     --type "help_needed" \
     --payload "E2E test: this should wake the agent (IMMEDIATE)" \
     --channel "session:${SESSION_ID}" \
@@ -28,7 +28,7 @@ sleep 2
 # Test 2: pattern_found → should trigger NORMAL injection
 echo "[Test 2] Sending pattern_found to repo channel..."
 REPO_NAME=$(basename "$(git rev-parse --show-toplevel 2>/dev/null)" 2>/dev/null || echo "unknown")
-agent-event-bus-cli "${URL_ARGS[@]}" publish \
+agent-event-bus-cli ${URL_ARGS[@]+"${URL_ARGS[@]}"} publish \
     --type "pattern_found" \
     --payload "E2E test: this should queue as followUp (NORMAL)" \
     --channel "repo:${REPO_NAME}" \
@@ -39,7 +39,7 @@ sleep 2
 
 # Test 3: session_heartbeat → should be AMBIENT (notify only)
 echo "[Test 3] Sending session_heartbeat (ambient)..."
-agent-event-bus-cli "${URL_ARGS[@]}" publish \
+agent-event-bus-cli ${URL_ARGS[@]+"${URL_ARGS[@]}"} publish \
     --type "session_heartbeat" \
     --payload "E2E test: this should only show as a notification" \
     --channel "all" \
