@@ -358,6 +358,9 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_switch", async (_event, ctx) => {
 		stopPolling();
+		pendingBatchEvents = [];
+		injectedTurnActive = false;
+		consecutiveFailures = 0;
 		currentCtx = ctx;
 		if (!cliAvailable) return;
 		const ok = await register(pi, ctx);
