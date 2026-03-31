@@ -16,7 +16,6 @@ read README.md, then ask which module(s) to work on. Based on the answer, read t
 - Check node_modules for external API type definitions instead of guessing
 - **NEVER use inline imports** - no `await import("./foo.js")`, no `import("pkg").Type` in type positions, no dynamic imports for types. Always use standard top-level imports.
 - NEVER remove or downgrade code to fix type errors from outdated dependencies; upgrade the dependency instead
-- Always ask before removing functionality or code that appears to be intentional
 - Do not preserve backward compatibility unless the user explicitly asks for it
 - Never hardcode key checks with, eg. `matchesKey(keyData, "ctrl+x")`. All keybindings must be configurable. Add default to matching object (`DEFAULT_EDITOR_KEYBINDINGS` or `DEFAULT_APP_KEYBINDINGS`)
 
@@ -27,7 +26,7 @@ read README.md, then ask which module(s) to work on. Based on the answer, read t
 - Run tests from the package root, not the repo root.
 - If you create or modify a test file, you MUST run that test file and iterate until it passes.
 - When writing tests, run them, identify issues in either the test or implementation, and iterate until fixed.
-- NEVER commit unless user asks
+- Verify compilation passes before committing
 
 ## GitHub Issues
 When reading issues:
@@ -181,7 +180,7 @@ The script handles: version bump, CHANGELOG finalization, commit, tag, publish, 
 
 ## **CRITICAL** Tool Usage Rules **CRITICAL**
 - NEVER use sed/cat to read a file or a range of a file. Always use the read tool (use offset + limit for ranged reads).
-- You MUST read every file you modify in full before editing.
+
 
 ### Git
 - ALWAYS include `fixes #<number>` or `closes #<number>` in the commit message when there is a related issue or PR
