@@ -1,0 +1,23 @@
+{
+	"name": "@evansenter/pi-event-bus",
+	"version": "0.1.0",
+	"type": "module",
+	"private": true,
+	"pi": {
+		"extensions": [
+			"./extensions/event-bus.ts"
+		],
+		"skills": [
+			"./skills/event-bus"
+		]
+	},
+	"description": "A [Pi Package](https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/packages.md) that connects Pi sessions to the [agent-event-bus](https://github.com/evansenter/agent-event-bus) for cross-session communication and coordination.",
+	"scripts": {
+		"test": "vitest --run"
+	},
+	"license": "MIT",
+	"devDependencies": {
+		"typescript": "^6.0.2",
+		"vitest": "^4.1.2"
+	}
+}
