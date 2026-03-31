@@ -12,8 +12,7 @@ import {
 	classifyTurn, freshTurn,
 	extractOutputSnippet, parseJsonFromOutput,
 	classifyEventPriority, formatEventForAgent, isEventStale, buildBatchMessage,
-	type FileActivity, type BashActivity, type TurnActivity, type ClassifiedEvent,
-	type EventPriority, type BusEvent,
+	type TurnActivity, type BusEvent,
 } from "../lib/classify.js";
 
 // ---------------------------------------------------------------------------
