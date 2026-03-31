@@ -78,8 +78,7 @@ To prevent runaway injection loops:
 
 | Mechanism | Value | Description |
 |-----------|-------|-------------|
-| Rate limit | 3 injections / min | Excess events remain buffered until rate window resets |
-| Cooldown | 30 s after each injection | No further injections until cooldown expires |
+| Cooldown | 30 s after each injection | No further injections until cooldown expires (max ~2/min) |
 | TTL | 5 min | Events older than 5 minutes are skipped |
 | Source filter | Drops own events | Events published by this session are never re-injected |
 | Batch cap | 20 events / poll | Oldest events beyond the cap are skipped |

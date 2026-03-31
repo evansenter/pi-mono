@@ -171,6 +171,8 @@ async function poll(pi: ExtensionAPI): Promise<void> {
 
 	const events = data.events as Array<Record<string, unknown>> | undefined;
 	if (!events || events.length === 0) {
+		// Flush any previously buffered events that were blocked by cooldown
+		flushInjections(pi);
 		updateStatus(true);
 		return;
 	}
@@ -308,6 +310,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("session_start", async (_event, ctx) => {
 		currentCtx = ctx;
+		consecutiveFailures = 0;
 
 		const check = await pi.exec("which", [CLI], { timeout: 5_000 });
 		cliAvailable = check.code === 0;
