@@ -8,6 +8,13 @@ import {
 	truncate,
 	type TurnActivity,
 } from "../lib/classify.js";
+import {
+	classifyEventPriority,
+	formatEventForAgent,
+	isEventStale,
+	buildBatchMessage,
+	type BusEvent,
+} from "../lib/classify.js";
 
 // ---------------------------------------------------------------------------
 // classifyTurn
@@ -383,5 +390,120 @@ describe("freshTurn", () => {
 		const b = freshTurn();
 		a.files.push({ path: "x", action: "write" });
 		expect(b.files).toEqual([]);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// classifyEventPriority
+// ---------------------------------------------------------------------------
+
+describe("classifyEventPriority", () => {
+	it("returns immediate for DM regardless of event type", () => {
+		expect(classifyEventPriority("task_completed", true)).toBe("immediate");
+	});
+	it("returns immediate for help_needed", () => {
+		expect(classifyEventPriority("help_needed", false)).toBe("immediate");
+	});
+	it("returns immediate for blocker", () => {
+		expect(classifyEventPriority("blocker", false)).toBe("immediate");
+	});
+	it("returns immediate for gotcha_discovered", () => {
+		expect(classifyEventPriority("gotcha_discovered", false)).toBe("immediate");
+	});
+	it("returns normal for task_completed", () => {
+		expect(classifyEventPriority("task_completed", false)).toBe("normal");
+	});
+	it("returns normal for pattern_found", () => {
+		expect(classifyEventPriority("pattern_found", false)).toBe("normal");
+	});
+	it("returns normal for improvement_suggested", () => {
+		expect(classifyEventPriority("improvement_suggested", false)).toBe("normal");
+	});
+	it("returns normal for help_response", () => {
+		expect(classifyEventPriority("help_response", false)).toBe("normal");
+	});
+	it("returns normal for user_broadcast", () => {
+		expect(classifyEventPriority("user_broadcast", false)).toBe("normal");
+	});
+	it("returns ambient for unknown event types", () => {
+		expect(classifyEventPriority("session_heartbeat", false)).toBe("ambient");
+	});
+	it("returns ambient for error_pattern", () => {
+		expect(classifyEventPriority("error_pattern", false)).toBe("ambient");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// formatEventForAgent
+// ---------------------------------------------------------------------------
+
+describe("formatEventForAgent", () => {
+	it("formats event with payload", () => {
+		const event: BusEvent = {
+			eventType: "help_needed", sender: "happy-tiger",
+			payload: "stuck on API design", channel: "repo:dotfiles",
+		};
+		const result = formatEventForAgent(event);
+		expect(result).toContain("[Event Bus]");
+		expect(result).toContain("help_needed");
+		expect(result).toContain("happy-tiger");
+		expect(result).toContain("stuck on API design");
+		expect(result).toContain("repo:dotfiles");
+	});
+	it("formats event without payload", () => {
+		const event: BusEvent = {
+			eventType: "task_completed", sender: "azure-gopher",
+			payload: "", channel: "all",
+		};
+		const result = formatEventForAgent(event);
+		expect(result).toContain("task_completed");
+		expect(result).not.toContain("\n");
+	});
+	it("marks DM events", () => {
+		const event: BusEvent = {
+			eventType: "dm", sender: "coral-goose",
+			payload: "check this out", channel: "session:abc123",
+		};
+		expect(formatEventForAgent(event)).toContain("[DM]");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// isEventStale
+// ---------------------------------------------------------------------------
+
+describe("isEventStale", () => {
+	it("returns true for events older than TTL", () => {
+		expect(isEventStale(Date.now() - 10 * 60 * 1000, 5 * 60 * 1000)).toBe(true);
+	});
+	it("returns false for recent events", () => {
+		expect(isEventStale(Date.now() - 60 * 1000, 5 * 60 * 1000)).toBe(false);
+	});
+	it("returns false when timestamp is 0 (unknown)", () => {
+		expect(isEventStale(0, 5 * 60 * 1000)).toBe(false);
+	});
+});
+
+// ---------------------------------------------------------------------------
+// buildBatchMessage
+// ---------------------------------------------------------------------------
+
+describe("buildBatchMessage", () => {
+	it("formats single event same as formatEventForAgent", () => {
+		const event: BusEvent = {
+			eventType: "help_needed", sender: "happy-tiger",
+			payload: "need help", channel: "repo:dotfiles",
+		};
+		expect(buildBatchMessage([event])).toBe(formatEventForAgent(event));
+	});
+	it("formats multiple events with header", () => {
+		const events: BusEvent[] = [
+			{ eventType: "help_needed", sender: "a", payload: "help", channel: "all" },
+			{ eventType: "pattern_found", sender: "b", payload: "pattern", channel: "all" },
+		];
+		const result = buildBatchMessage(events);
+		expect(result).toContain("[Event Bus] 2 pending events:");
+		expect(result).toContain("help_needed");
+		expect(result).toContain("pattern_found");
 	});
 });
