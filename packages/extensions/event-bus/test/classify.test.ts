@@ -1,18 +1,16 @@
 import { describe, expect, it } from "vitest";
 import {
 	classifyTurn,
+	classifyEventPriority,
 	extractOutputSnippet,
+	formatEventForAgent,
 	formatFiles,
 	freshTurn,
+	isEventStale,
+	buildBatchMessage,
 	parseJsonFromOutput,
 	truncate,
 	type TurnActivity,
-} from "../lib/classify.js";
-import {
-	classifyEventPriority,
-	formatEventForAgent,
-	isEventStale,
-	buildBatchMessage,
 	type BusEvent,
 } from "../lib/classify.js";
 

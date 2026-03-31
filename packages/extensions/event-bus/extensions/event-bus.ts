@@ -159,7 +159,7 @@ async function poll(pi: ExtensionAPI): Promise<void> {
 		);
 		updateStatus(false, `retry in ${Math.round(backoffMs / 1000)}s`);
 		stopPolling();
-		setTimeout(() => { if (state) startPolling(pi); }, backoffMs);
+		backoffTimer = setTimeout(() => { backoffTimer = undefined; if (state) startPolling(pi); }, backoffMs);
 		return;
 	}
 
@@ -213,6 +213,7 @@ async function poll(pi: ExtensionAPI): Promise<void> {
 }
 
 let polling = false;
+let backoffTimer: ReturnType<typeof setTimeout> | undefined;
 
 function startPolling(pi: ExtensionAPI): void {
 	stopPolling();
@@ -228,6 +229,10 @@ function stopPolling(): void {
 	if (pollTimer != null) {
 		clearInterval(pollTimer);
 		pollTimer = undefined;
+	}
+	if (backoffTimer != null) {
+		clearTimeout(backoffTimer);
+		backoffTimer = undefined;
 	}
 }
 
