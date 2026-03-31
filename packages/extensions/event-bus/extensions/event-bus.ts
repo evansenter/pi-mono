@@ -22,7 +22,7 @@ import {
 const EVENT_BUS_URL = process.env.AGENT_EVENT_BUS_URL ?? "http://127.0.0.1:8080/mcp";
 const ACTIVE_POLL_MS = 5_000;
 const IDLE_POLL_MS = Number(process.env.PI_EVENT_BUS_POLL_INTERVAL ?? "30") * 1_000;
-const INJECTION_COOLDOWN_MS = 30_000;
+const INJECTION_COOLDOWN_MS = Number(process.env.PI_EVENT_BUS_INJECTION_COOLDOWN ?? "30") * 1_000;
 const EVENT_TTL_MS = 5 * 60 * 1_000;
 const BACKOFF_BASE_MS = 5_000;
 const BACKOFF_MAX_MS = 5 * 60 * 1_000;

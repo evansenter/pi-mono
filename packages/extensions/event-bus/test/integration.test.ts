@@ -16,6 +16,8 @@
 // static import placed after this assignment.
 const savedPollInterval = process.env.PI_EVENT_BUS_POLL_INTERVAL;
 process.env.PI_EVENT_BUS_POLL_INTERVAL = "1";
+const savedCooldown = process.env.PI_EVENT_BUS_INJECTION_COOLDOWN;
+process.env.PI_EVENT_BUS_INJECTION_COOLDOWN = "2";
 
 import { execSync } from "node:child_process";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
@@ -193,6 +195,11 @@ describe.skipIf(!cliAvailable || !busReachable)(
 				process.env.PI_EVENT_BUS_POLL_INTERVAL = savedPollInterval;
 			} else {
 				delete process.env.PI_EVENT_BUS_POLL_INTERVAL;
+			}
+			if (savedCooldown !== undefined) {
+				process.env.PI_EVENT_BUS_INJECTION_COOLDOWN = savedCooldown;
+			} else {
+				delete process.env.PI_EVENT_BUS_INJECTION_COOLDOWN;
 			}
 		});
 
@@ -383,6 +390,71 @@ describe.skipIf(!cliAvailable || !busReachable)(
 				expect(getSessionCount()).toBeLessThan(countAfterReg);
 			},
 			15_000,
+		);
+
+		it(
+			"cross-session: A publishes task_completed, B receives injection and responds",
+			async () => {
+				// Same pattern as the single-session injection test, but the event
+				// type is task_completed (NORMAL priority → followUp delivery) and
+				// comes from a "Session A" sender — proving cross-session communication.
+				harness = await createHarnessWithExtensions({
+					responses: ["B acknowledges", "B responds to event from A"],
+					extensionFactories: [eventBusExtension],
+				});
+
+				await harness.session.bindExtensions({});
+
+				await waitFor(() => getSessionCount() > 0, {
+					timeoutMs: 5_000,
+					label: "session registration",
+				});
+
+				await harness.session.prompt("ready and waiting");
+				expect(harness.faux.callCount).toBe(1);
+
+				// Wait for cooldown from any previous test's injection to expire.
+				// Tests share module state (lastInjectionTime) within this describe block.
+				await new Promise((r) => setTimeout(r, 3000));
+
+				// Simulate Session A publishing to B's repo channel
+				const repoChanB = `repo:${harness.tempDir.split("/").pop() ?? "unknown"}`;
+				const senderClientId = `roundtrip-a-${Date.now()}`;
+				const sender = registerSession("session-a", senderClientId);
+
+				try {
+					publishEvent({
+						type: "help_needed",
+						payload: "Session A needs help — cross-session test marker",
+						channel: repoChanB,
+						sessionId: sender.sessionId,
+					});
+
+					// Wait for B to poll, classify NORMAL, inject via followUp, faux LLM responds
+					await waitFor(() => harness.faux.callCount >= 2, {
+						timeoutMs: 10_000,
+						intervalMs: 500,
+						label: "Session B wakes from Session A's event",
+					});
+
+					// Verify the faux LLM was called a second time (injection triggered a turn)
+					expect(harness.faux.callCount).toBe(2);
+
+					// Verify the injected event content is somewhere in the session messages
+					const allMessages = harness.session.messages;
+					const hasEventContent = allMessages.some(
+						(m) => {
+							const content = typeof m.content === "string" ? m.content
+								: Array.isArray(m.content) ? m.content.map((c: any) => c.text ?? "").join("") : "";
+							return content.includes("help_needed") && content.includes("cross-session test marker");
+						},
+					);
+					expect(hasEventContent).toBe(true);
+				} finally {
+					unregisterSession(sender.sessionId);
+				}
+			},
+			30_000,
 		);
 	},
 );
