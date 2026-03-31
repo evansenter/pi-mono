@@ -34,6 +34,7 @@ function createMockPi() {
 		registerCommand(name: string, options: any) {
 			commands.push({ name, options });
 		},
+		sendMessage: vi.fn(),
 		exec: vi.fn(async (command: string, args: string[], options?: any) => {
 			execCalls.push({ command, args, options });
 
@@ -357,6 +358,65 @@ describe("extension event wiring", () => {
 		expect(publishCall).toBeUndefined();
 	});
 
+	it("does not auto-publish on injected turn", async () => {
+		await loadExtension();
+		await simulateSessionStart();
+
+		const agentStart = mock.getHandler("agent_start");
+		const toolStart = mock.getHandler("tool_execution_start");
+		const toolEnd = mock.getHandler("tool_execution_end");
+		const agentEnd = mock.getHandler("agent_end");
+
+		// Set up exec to return a DM event on the next poll
+		const originalExec = mock.pi.exec.getMockImplementation()!;
+		let pollCount = 0;
+		mock.pi.exec.mockImplementation(async (command: string, args: string[], options?: any) => {
+			if (args.includes("events") && pollCount === 0) {
+				pollCount++;
+				return {
+					stdout: JSON.stringify({
+						events: [{
+							event_type: "dm",
+							session_display_id: "other-parrot",
+							payload: "hey",
+							channel: "session:test-session",
+							session_id: "other-session",
+							timestamp: Date.now() / 1000,
+						}],
+						next_cursor: "1",
+					}),
+					stderr: "",
+					code: 0,
+					killed: false,
+				};
+			}
+			return originalExec(command, args, options);
+		});
+
+		// Trigger a poll by starting/stopping polling (which fires immediate poll)
+		await agentStart({});
+
+		// Wait a tick for the poll to resolve
+		await new Promise((r) => setTimeout(r, 50));
+
+		// sendMessage should have been called with the DM
+		expect(mock.pi.sendMessage).toHaveBeenCalled();
+
+		// Now simulate agent_end — should NOT auto-publish because injectedTurnActive is true
+		// First add some file writes to make it look like a real turn
+		await toolStart({ type: "tool_execution_start", toolCallId: "tc1", toolName: "write", args: { path: "a.ts", content: "" } });
+		await toolEnd({ type: "tool_execution_end", toolCallId: "tc1", toolName: "write", result: { content: [] }, isError: false });
+		await toolStart({ type: "tool_execution_start", toolCallId: "tc2", toolName: "write", args: { path: "b.ts", content: "" } });
+		await toolEnd({ type: "tool_execution_end", toolCallId: "tc2", toolName: "write", result: { content: [] }, isError: false });
+
+		mock.execCalls.length = 0;
+		await agentEnd({});
+
+		// Should NOT have published because injectedTurnActive suppresses it
+		const publishCall = mock.execCalls.find((c) => c.args.includes("publish"));
+		expect(publishCall).toBeUndefined();
+	});
+
 	it("publishes to repo channel derived from cwd", async () => {
 		await loadExtension();
 		await simulateSessionStart();
@@ -377,5 +437,180 @@ describe("extension event wiring", () => {
 		expect(publishCall).toBeDefined();
 		const channelIndex = publishCall!.args.indexOf("--channel") + 1;
 		expect(publishCall!.args[channelIndex]).toBe("repo:my-repo");
+	});
+});
+
+// ---------------------------------------------------------------------------
+// Injection Dispatch Tests
+// ---------------------------------------------------------------------------
+
+describe("injection dispatch", () => {
+	let mock: ReturnType<typeof createMockPi>;
+	let ctx: ReturnType<typeof createMockCtx>;
+
+	beforeEach(async () => {
+		vi.resetModules();
+		mock = createMockPi();
+		ctx = createMockCtx();
+	});
+
+	async function loadExtension() {
+		const mod = await import("../extensions/event-bus.js");
+		mod.default(mock.pi as any);
+	}
+
+	async function simulateSessionStart() {
+		const sessionStartHandlers = mock.handlers.filter((h) => h.event === "session_start").map((h) => h.handler);
+		for (const h of sessionStartHandlers) {
+			await h({}, ctx);
+		}
+	}
+
+	function makeEventsResponse(events: Array<Record<string, unknown>>) {
+		return {
+			stdout: JSON.stringify({ events, next_cursor: "1" }),
+			stderr: "",
+			code: 0,
+			killed: false,
+		};
+	}
+
+	function setupEventsExec(events: Array<Record<string, unknown>>) {
+		const originalExec = mock.pi.exec.getMockImplementation()!;
+		let served = false;
+		mock.pi.exec.mockImplementation(async (command: string, args: string[], options?: any) => {
+			if (args.includes("events") && !served) {
+				served = true;
+				return makeEventsResponse(events);
+			}
+			return originalExec(command, args, options);
+		});
+	}
+
+	it("dispatches DM events as urgent with steer", async () => {
+		await loadExtension();
+		await simulateSessionStart();
+
+		setupEventsExec([{
+			event_type: "dm",
+			session_display_id: "sender-parrot",
+			payload: "hello there",
+			channel: "session:test-session",
+			session_id: "other-session",
+			timestamp: Date.now() / 1000,
+		}]);
+
+		const agentStart = mock.handlers.find((h) => h.event === "agent_start")!.handler;
+		await agentStart({});
+		await new Promise((r) => setTimeout(r, 50));
+
+		expect(mock.pi.sendMessage).toHaveBeenCalledWith(
+			expect.objectContaining({ customType: "event-bus-urgent", display: false }),
+			expect.objectContaining({ triggerTurn: true, deliverAs: "steer" }),
+		);
+	});
+
+	it("dispatches pattern_found as normal with followUp", async () => {
+		await loadExtension();
+		await simulateSessionStart();
+
+		setupEventsExec([{
+			event_type: "pattern_found",
+			session_display_id: "sender-parrot",
+			payload: "found a pattern",
+			channel: "repo:my-repo",
+			session_id: "other-session",
+			timestamp: Date.now() / 1000,
+		}]);
+
+		const agentStart = mock.handlers.find((h) => h.event === "agent_start")!.handler;
+		await agentStart({});
+		await new Promise((r) => setTimeout(r, 50));
+
+		expect(mock.pi.sendMessage).toHaveBeenCalledWith(
+			expect.objectContaining({ customType: "event-bus-event", display: false }),
+			expect.objectContaining({ triggerTurn: true, deliverAs: "followUp" }),
+		);
+	});
+
+	it("dispatches session_heartbeat as ambient notification only", async () => {
+		await loadExtension();
+		await simulateSessionStart();
+
+		setupEventsExec([{
+			event_type: "session_heartbeat",
+			session_display_id: "sender-parrot",
+			payload: "",
+			channel: "all",
+			session_id: "other-session",
+			timestamp: Date.now() / 1000,
+		}]);
+
+		const agentStart = mock.handlers.find((h) => h.event === "agent_start")!.handler;
+		await agentStart({});
+		await new Promise((r) => setTimeout(r, 50));
+
+		// Should NOT call sendMessage for ambient events
+		expect(mock.pi.sendMessage).not.toHaveBeenCalled();
+		// Should call notify
+		expect(ctx.ui.notify).toHaveBeenCalledWith(
+			expect.stringContaining("session_heartbeat"),
+			"info",
+		);
+	});
+
+	it("skips own session events", async () => {
+		await loadExtension();
+		await simulateSessionStart();
+
+		setupEventsExec([{
+			event_type: "task_completed",
+			session_display_id: "test-parrot",
+			payload: "did stuff",
+			channel: "repo:my-repo",
+			session_id: "test-session", // Same as our session
+			timestamp: Date.now() / 1000,
+		}]);
+
+		// Clear notify calls from session_start
+		ctx.ui.notify.mockClear();
+
+		const agentStart = mock.handlers.find((h) => h.event === "agent_start")!.handler;
+		await agentStart({});
+		await new Promise((r) => setTimeout(r, 50));
+
+		expect(mock.pi.sendMessage).not.toHaveBeenCalled();
+		// notify should not have been called with our event
+		const notifyCalls = ctx.ui.notify.mock.calls;
+		const eventNotify = notifyCalls.find((c: any[]) => typeof c[0] === "string" && c[0].includes("task_completed"));
+		expect(eventNotify).toBeUndefined();
+	});
+
+	it("skips stale events", async () => {
+		await loadExtension();
+		await simulateSessionStart();
+
+		// Timestamp from 10 minutes ago (beyond 5min TTL)
+		const staleTimestamp = (Date.now() - 10 * 60 * 1000) / 1000;
+
+		setupEventsExec([{
+			event_type: "task_completed",
+			session_display_id: "sender-parrot",
+			payload: "old stuff",
+			channel: "repo:my-repo",
+			session_id: "other-session",
+			timestamp: staleTimestamp,
+		}]);
+
+		ctx.ui.notify.mockClear();
+
+		const agentStart = mock.handlers.find((h) => h.event === "agent_start")!.handler;
+		await agentStart({});
+		await new Promise((r) => setTimeout(r, 50));
+
+		expect(mock.pi.sendMessage).not.toHaveBeenCalled();
+		const notifyCalls = ctx.ui.notify.mock.calls;
+		const eventNotify = notifyCalls.find((c: any[]) => typeof c[0] === "string" && c[0].includes("task_completed"));
+		expect(eventNotify).toBeUndefined();
 	});
 });

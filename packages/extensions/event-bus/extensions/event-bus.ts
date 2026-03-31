@@ -11,7 +11,9 @@ import type { ExtensionAPI, ExtensionContext, ExecResult } from "@mariozechner/p
 import {
 	classifyTurn, freshTurn,
 	extractOutputSnippet, parseJsonFromOutput,
+	classifyEventPriority, formatEventForAgent, isEventStale, buildBatchMessage,
 	type FileActivity, type BashActivity, type TurnActivity, type ClassifiedEvent,
+	type EventPriority, type BusEvent,
 } from "../lib/classify.js";
 
 // ---------------------------------------------------------------------------
@@ -19,7 +21,14 @@ import {
 // ---------------------------------------------------------------------------
 
 const EVENT_BUS_URL = process.env.AGENT_EVENT_BUS_URL ?? "http://127.0.0.1:8080/mcp";
-const POLL_INTERVAL_MS = Number(process.env.PI_EVENT_BUS_POLL_INTERVAL ?? "30") * 1000;
+const ACTIVE_POLL_MS = 5_000;
+const IDLE_POLL_MS = Number(process.env.PI_EVENT_BUS_POLL_INTERVAL ?? "30") * 1_000;
+const INJECTION_COOLDOWN_MS = 30_000;
+const MAX_INJECTIONS_PER_MINUTE = 3;
+const EVENT_TTL_MS = 5 * 60 * 1_000;
+const BACKOFF_BASE_MS = 5_000;
+const BACKOFF_MAX_MS = 5 * 60 * 1_000;
+const MAX_BATCH_SIZE = 20;
 const CLI = "agent-event-bus-cli";
 
 // ---------------------------------------------------------------------------
@@ -39,6 +48,13 @@ let cliAvailable = false;
 
 let currentTurn: TurnActivity = freshTurn();
 const pendingArgs = new Map<string, Record<string, unknown>>();
+
+let agentActive = false;
+let lastInjectionTime = 0;
+const recentInjectionTimes: number[] = [];
+let injectedTurnActive = false;
+let consecutiveFailures = 0;
+let pendingBatchEvents: BusEvent[] = [];
 
 // ---------------------------------------------------------------------------
 // CLI / Status Helpers
@@ -136,12 +152,21 @@ async function poll(pi: ExtensionAPI): Promise<void> {
 	]);
 
 	if (result.code !== 0) {
-		updateStatus(false);
+		consecutiveFailures++;
+		const backoffMs = Math.min(
+			BACKOFF_BASE_MS * Math.pow(2, consecutiveFailures - 1),
+			BACKOFF_MAX_MS,
+		);
+		updateStatus(false, `retry in ${Math.round(backoffMs / 1000)}s`);
+		stopPolling();
+		setTimeout(() => { if (state) startPolling(pi); }, backoffMs);
 		return;
 	}
 
 	const data = parseJson(result);
 	if (!data) return;
+
+	consecutiveFailures = 0;
 
 	if (typeof data.next_cursor === "string") {
 		state.cursor = data.next_cursor;
@@ -158,16 +183,31 @@ async function poll(pi: ExtensionAPI): Promise<void> {
 		const sender = evt.session_display_id as string ?? evt.session_name as string ?? "unknown";
 		const payload = evt.payload as string ?? "";
 		const channel = evt.channel as string ?? "";
+		const eventSessionId = evt.session_id as string ?? "";
+
+		// Source filtering: skip own events
+		if (eventSessionId === state.sessionId) continue;
+
+		// TTL filtering: skip stale events
+		const rawTimestamp = evt.timestamp as number ?? 0;
+		const timestampMs = rawTimestamp > 1e12 ? rawTimestamp : rawTimestamp * 1000;
+		if (isEventStale(timestampMs, EVENT_TTL_MS)) continue;
 
 		const isDm = channel.startsWith("session:") && channel.includes(state.sessionId);
-		const isRepoTargeted = channel.startsWith("repo:");
-		const notifType = isDm ? "warning" as const : "info" as const;
+		const priority = classifyEventPriority(eventType, isDm);
 
-		const prefix = isDm ? "[DM]" : isRepoTargeted ? `[${channel}]` : "[bus]";
-		const line = `${prefix} ${sender}: ${eventType}${payload ? ` — ${payload}` : ""}`;
-
-		currentCtx.ui.notify(line, notifType);
+		if (priority === "ambient") {
+			const isRepoTargeted = channel.startsWith("repo:");
+			const notifType = isDm ? "warning" as const : "info" as const;
+			const prefix = isDm ? "[DM]" : isRepoTargeted ? `[${channel}]` : "[bus]";
+			const line = `${prefix} ${sender}: ${eventType}${payload ? ` — ${payload}` : ""}`;
+			currentCtx.ui.notify(line, notifType);
+		} else {
+			pendingBatchEvents.push({ eventType, sender, payload, channel, timestampMs });
+		}
 	}
+
+	flushInjections(pi);
 
 	updateStatus(true);
 }
@@ -181,7 +221,7 @@ function startPolling(pi: ExtensionAPI): void {
 		if (polling) return;
 		polling = true;
 		try { await poll(pi); } finally { polling = false; }
-	}, POLL_INTERVAL_MS);
+	}, agentActive ? ACTIVE_POLL_MS : IDLE_POLL_MS);
 }
 
 function stopPolling(): void {
@@ -191,11 +231,20 @@ function stopPolling(): void {
 	}
 }
 
+function reschedulePolling(pi: ExtensionAPI): void {
+	stopPolling();
+	startPolling(pi);
+}
+
 // ---------------------------------------------------------------------------
 // Auto-Publish
 // ---------------------------------------------------------------------------
 
 async function autoPublish(pi: ExtensionAPI, turn: TurnActivity): Promise<void> {
+	if (injectedTurnActive) {
+		injectedTurnActive = false;
+		return;
+	}
 	if (!state || !cliAvailable) return;
 
 	const classified = classifyTurn(turn);
@@ -208,6 +257,61 @@ async function autoPublish(pi: ExtensionAPI, turn: TurnActivity): Promise<void> 
 		"--channel", `repo:${currentCtx?.cwd.split("/").pop() ?? "unknown"}`,
 		"--session-id", state.sessionId,
 	]);
+}
+
+function flushInjections(pi: ExtensionAPI): void {
+	if (pendingBatchEvents.length === 0 || !currentCtx) return;
+
+	const now = Date.now();
+
+	// Prune rate limit window
+	const windowStart = now - 60_000;
+	while (recentInjectionTimes.length > 0 && recentInjectionTimes[0] < windowStart) {
+		recentInjectionTimes.shift();
+	}
+
+	// Rate limit check
+	if (recentInjectionTimes.length >= MAX_INJECTIONS_PER_MINUTE) {
+		currentCtx.ui.notify(
+			`[Event Bus] Rate limited — ${pendingBatchEvents.length} event(s) buffered`,
+			"warning",
+		);
+		return;
+	}
+
+	// Cooldown check
+	if (now - lastInjectionTime < INJECTION_COOLDOWN_MS) {
+		return;
+	}
+
+	// Cap batch size
+	if (pendingBatchEvents.length > MAX_BATCH_SIZE) {
+		currentCtx.ui.notify(
+			`[Event Bus] Dropping ${pendingBatchEvents.length - MAX_BATCH_SIZE} oldest events (batch cap)`,
+			"warning",
+		);
+		pendingBatchEvents = pendingBatchEvents.slice(-MAX_BATCH_SIZE);
+	}
+
+	// Determine highest priority in batch
+	const hasImmediate = pendingBatchEvents.some((e) => {
+		const isDm = e.channel.startsWith("session:") && state ? e.channel.includes(state.sessionId) : false;
+		return classifyEventPriority(e.eventType, isDm) === "immediate";
+	});
+
+	const content = buildBatchMessage(pendingBatchEvents);
+	const customType = hasImmediate ? "event-bus-urgent" : "event-bus-event";
+	const deliverAs = hasImmediate ? "steer" as const : "followUp" as const;
+
+	pi.sendMessage(
+		{ customType, content, display: false },
+		{ triggerTurn: true, deliverAs },
+	);
+
+	injectedTurnActive = true;
+	lastInjectionTime = now;
+	recentInjectionTimes.push(now);
+	pendingBatchEvents = [];
 }
 
 // ---------------------------------------------------------------------------
@@ -261,6 +365,8 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("agent_start", async () => {
 		currentTurn = freshTurn();
+		agentActive = true;
+		if (state && cliAvailable) reschedulePolling(pi);
 	});
 
 	pi.on("tool_execution_start", async (event) => {
@@ -302,6 +408,8 @@ export default function (pi: ExtensionAPI) {
 	pi.on("agent_end", async () => {
 		await autoPublish(pi, currentTurn);
 		currentTurn = freshTurn();
+		agentActive = false;
+		if (state && cliAvailable) reschedulePolling(pi);
 	});
 
 	// ------------------------------------------------------------------
