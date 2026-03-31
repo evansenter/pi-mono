@@ -49,12 +49,47 @@ The extension automatically broadcasts events to the `repo:<name>` channel when 
 
 Read-only turns, conversational responses, and trivial single-file edits are not published.
 
+## Event Injection
+
+The extension actively injects incoming events into the agent conversation rather than just showing notifications. When events arrive during polling, they are classified by urgency and dispatched accordingly.
+
+### Event Priority Classification
+
+| Priority | Dispatch | Event Types |
+|----------|----------|-------------|
+| IMMEDIATE | `sendMessage` + steer (interrupts current work) | `DM` (any channel targeting your session), `help_needed`, `blocker`, `gotcha_discovered`, `ci_failure` |
+| NORMAL | `sendMessage` + followUp (queued until turn ends) | `task_completed`, `pattern_found`, `improvement_suggested`, `help_response`, `user_broadcast`, `rfc_created` |
+| AMBIENT | `ui.notify` only (no conversation injection) | All other event types |
+
+IMMEDIATE events wake the agent immediately — use them for urgent cross-session coordination. NORMAL events are held until the agent finishes its current turn to avoid interrupting mid-task. AMBIENT events surface as UI notifications and appear in `/events` history but do not enter the conversation.
+
+### Adaptive Polling
+
+The poller adjusts its interval based on agent activity:
+
+- **5 seconds** while the agent is actively running (tool calls in flight)
+- **30 seconds** when idle (configurable via `PI_EVENT_BUS_POLL_INTERVAL`)
+
+This keeps latency low during collaborative work without hammering the bus when nothing is happening.
+
+### Safety Mechanisms
+
+To prevent runaway injection loops:
+
+| Mechanism | Value | Description |
+|-----------|-------|-------------|
+| Rate limit | 3 injections / min | Excess events are downgraded to AMBIENT |
+| Cooldown | 30 s after each injection | No further injections until cooldown expires |
+| TTL | 5 min | Events older than 5 minutes are skipped |
+| Source filter | Drops own events | Events published by this session are never re-injected |
+| Batch cap | 20 events / poll | Oldest events beyond the cap are skipped |
+
 ## Configuration
 
 | Setting | Default | Env Var |
 |---------|---------|---------|
 | Event bus URL | `http://127.0.0.1:8080/mcp` | `AGENT_EVENT_BUS_URL` |
-| Poll interval | 30s | `PI_EVENT_BUS_POLL_INTERVAL` |
+| Poll interval (idle) | 30s | `PI_EVENT_BUS_POLL_INTERVAL` |
 
 ## Session Lifecycle
 
