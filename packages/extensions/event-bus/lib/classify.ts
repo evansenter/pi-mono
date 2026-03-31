@@ -139,6 +139,8 @@ export interface BusEvent {
 	timestampMs?: number;
 }
 
+// gotcha_discovered is IMMEDIATE (not NORMAL as in the RFC) because gotchas
+// typically indicate something another session should act on immediately.
 const IMMEDIATE_TYPES = new Set(["help_needed", "blocker", "gotcha_discovered", "ci_failure", "dm"]);
 const NORMAL_TYPES = new Set([
 	"task_completed", "improvement_suggested", "pattern_found",

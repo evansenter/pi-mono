@@ -23,7 +23,6 @@ const EVENT_BUS_URL = process.env.AGENT_EVENT_BUS_URL ?? "http://127.0.0.1:8080/
 const ACTIVE_POLL_MS = 5_000;
 const IDLE_POLL_MS = Number(process.env.PI_EVENT_BUS_POLL_INTERVAL ?? "30") * 1_000;
 const INJECTION_COOLDOWN_MS = 30_000;
-const MAX_INJECTIONS_PER_MINUTE = 3;
 const EVENT_TTL_MS = 5 * 60 * 1_000;
 const BACKOFF_BASE_MS = 5_000;
 const BACKOFF_MAX_MS = 5 * 60 * 1_000;
@@ -50,8 +49,6 @@ const pendingArgs = new Map<string, Record<string, unknown>>();
 
 let agentActive = false;
 let lastInjectionTime = 0;
-const recentInjectionTimes: number[] = [];
-let injectedTurnActive = false;
 let consecutiveFailures = 0;
 let pendingBatchEvents: BusEvent[] = [];
 
@@ -246,12 +243,6 @@ function reschedulePolling(pi: ExtensionAPI): void {
 // ---------------------------------------------------------------------------
 
 async function autoPublish(pi: ExtensionAPI, turn: TurnActivity): Promise<void> {
-	// Skip auto-publish for turns triggered by event bus injection.
-	// Relies on INJECTION_COOLDOWN_MS >= ACTIVE_POLL_MS to prevent double-set.
-	if (injectedTurnActive) {
-		injectedTurnActive = false;
-		return;
-	}
 	if (!state || !cliAvailable) return;
 
 	const classified = classifyTurn(turn);
@@ -271,22 +262,9 @@ function flushInjections(pi: ExtensionAPI): void {
 
 	const now = Date.now();
 
-	// Prune rate limit window
-	const windowStart = now - 60_000;
-	while (recentInjectionTimes.length > 0 && recentInjectionTimes[0] < windowStart) {
-		recentInjectionTimes.shift();
-	}
-
-	// Rate limit check
-	if (recentInjectionTimes.length >= MAX_INJECTIONS_PER_MINUTE) {
-		currentCtx.ui.notify(
-			`[Event Bus] Rate limited — ${pendingBatchEvents.length} event(s) buffered`,
-			"warning",
-		);
-		return;
-	}
-
-	// Cooldown check
+	// Cooldown: at most one injection per INJECTION_COOLDOWN_MS.
+	// This alone prevents runaway loops (max ~2 injections/min at 30s cooldown).
+	// Source filtering also prevents self-injection, providing a second safety layer.
 	if (now - lastInjectionTime < INJECTION_COOLDOWN_MS) {
 		return;
 	}
@@ -311,13 +289,11 @@ function flushInjections(pi: ExtensionAPI): void {
 	const deliverAs = hasImmediate ? "steer" as const : "followUp" as const;
 
 	pi.sendMessage(
-		{ customType, content, display: false },
+		{ customType, content, display: true },
 		{ triggerTurn: true, deliverAs },
 	);
 
-	injectedTurnActive = true;
 	lastInjectionTime = now;
-	recentInjectionTimes.push(now);
 	pendingBatchEvents = [];
 }
 
@@ -359,11 +335,9 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_switch", async (_event, ctx) => {
 		stopPolling();
 		pendingBatchEvents = [];
-		injectedTurnActive = false;
 		consecutiveFailures = 0;
 		agentActive = false;
 		lastInjectionTime = 0;
-		recentInjectionTimes.length = 0;
 		currentTurn = freshTurn();
 		pendingArgs.clear();
 		currentCtx = ctx;

@@ -358,32 +358,29 @@ describe("extension event wiring", () => {
 		expect(publishCall).toBeUndefined();
 	});
 
-	it("does not auto-publish on injected turn", async () => {
+	it("respects cooldown between injections", async () => {
 		await loadExtension();
 		await simulateSessionStart();
 
 		const agentStart = mock.getHandler("agent_start");
-		const toolStart = mock.getHandler("tool_execution_start");
-		const toolEnd = mock.getHandler("tool_execution_end");
-		const agentEnd = mock.getHandler("agent_end");
 
-		// Set up exec to return a DM event on the next poll
+		// Set up exec to return events on every poll
 		const originalExec = mock.pi.exec.getMockImplementation()!;
 		let pollCount = 0;
 		mock.pi.exec.mockImplementation(async (command: string, args: string[], options?: any) => {
-			if (args.includes("events") && pollCount === 0) {
+			if (args.includes("events")) {
 				pollCount++;
 				return {
 					stdout: JSON.stringify({
 						events: [{
-							event_type: "dm",
+							event_type: "help_needed",
 							session_display_id: "other-parrot",
-							payload: "hey",
+							payload: `event-${pollCount}`,
 							channel: "session:test-session",
 							session_id: "other-session",
 							timestamp: Date.now() / 1000,
 						}],
-						next_cursor: "1",
+						next_cursor: String(pollCount),
 					}),
 					stderr: "",
 					code: 0,
@@ -393,28 +390,16 @@ describe("extension event wiring", () => {
 			return originalExec(command, args, options);
 		});
 
-		// Trigger a poll by starting/stopping polling (which fires immediate poll)
+		// First poll — should inject
 		await agentStart({});
-
-		// Wait a tick for the poll to resolve
 		await new Promise((r) => setTimeout(r, 50));
+		expect(mock.pi.sendMessage).toHaveBeenCalledTimes(1);
 
-		// sendMessage should have been called with the DM
-		expect(mock.pi.sendMessage).toHaveBeenCalled();
-
-		// Now simulate agent_end — should NOT auto-publish because injectedTurnActive is true
-		// First add some file writes to make it look like a real turn
-		await toolStart({ type: "tool_execution_start", toolCallId: "tc1", toolName: "write", args: { path: "a.ts", content: "" } });
-		await toolEnd({ type: "tool_execution_end", toolCallId: "tc1", toolName: "write", result: { content: [] }, isError: false });
-		await toolStart({ type: "tool_execution_start", toolCallId: "tc2", toolName: "write", args: { path: "b.ts", content: "" } });
-		await toolEnd({ type: "tool_execution_end", toolCallId: "tc2", toolName: "write", result: { content: [] }, isError: false });
-
-		mock.execCalls.length = 0;
-		await agentEnd({});
-
-		// Should NOT have published because injectedTurnActive suppresses it
-		const publishCall = mock.execCalls.find((c) => c.args.includes("publish"));
-		expect(publishCall).toBeUndefined();
+		// Second poll (immediately after) — should be blocked by cooldown
+		mock.pi.sendMessage.mockClear();
+		await agentStart({});
+		await new Promise((r) => setTimeout(r, 50));
+		expect(mock.pi.sendMessage).not.toHaveBeenCalled();
 	});
 
 	it("publishes to repo channel derived from cwd", async () => {
@@ -505,7 +490,7 @@ describe("injection dispatch", () => {
 		await new Promise((r) => setTimeout(r, 50));
 
 		expect(mock.pi.sendMessage).toHaveBeenCalledWith(
-			expect.objectContaining({ customType: "event-bus-urgent", display: false }),
+			expect.objectContaining({ customType: "event-bus-urgent", display: true }),
 			expect.objectContaining({ triggerTurn: true, deliverAs: "steer" }),
 		);
 	});
@@ -528,7 +513,7 @@ describe("injection dispatch", () => {
 		await new Promise((r) => setTimeout(r, 50));
 
 		expect(mock.pi.sendMessage).toHaveBeenCalledWith(
-			expect.objectContaining({ customType: "event-bus-event", display: false }),
+			expect.objectContaining({ customType: "event-bus-event", display: true }),
 			expect.objectContaining({ triggerTurn: true, deliverAs: "followUp" }),
 		);
 	});
