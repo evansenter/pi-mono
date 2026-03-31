@@ -83,6 +83,33 @@ To prevent runaway injection loops:
 | Source filter | Drops own events | Events published by this session are never re-injected |
 | Batch cap | 20 events / poll | Oldest events beyond the cap are skipped |
 
+### Injection Flow
+
+```
+poll() every 1-30s
+  │
+  ├─ CLI returns events → filter (source, TTL) → classify → batch
+  │                                                           │
+  ├─ CLI returns 0 events ──────────────────────────┐         │
+  │                                                 ▼         ▼
+  │                                          flushInjections()
+  │                                                 │
+  │                                    ┌────────────┤
+  │                                    │ cooldown?  │ batch empty?
+  │                                    │ → hold     │ → noop
+  │                                    │            │
+  │                                    └──► pi.sendMessage()
+  │                                           │
+  │                                    triggerTurn: true
+  │                                    deliverAs: steer | followUp
+  │                                           │
+  │                                    Agent wakes / queues
+  │                                           │
+  └─ agent_end → autoPublish()         Agent responds
+```
+
+Events that arrive during a cooldown window are buffered in `pendingBatchEvents`. The buffer is drained on the next `flushInjections` call — which happens on every poll, even when no new events arrive. Multiple buffered events are combined into a single `sendMessage` call. If any event in the batch is IMMEDIATE, the entire batch uses `steer` delivery; otherwise `followUp`.
+
 ## Configuration
 
 | Setting | Default | Env Var |
